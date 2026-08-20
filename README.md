@@ -5,7 +5,7 @@ IEEE 802.11 모니터링 프로그램입니다.
 
 ## 실행 영상
 
-[airodump.mp4](./airodump.mp4)
+[YouTube에서 실행 영상 보기](https://youtu.be/KG3DTrdwk-c)
 
 
 ## 의존성 설치

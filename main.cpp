@@ -1,4 +1,5 @@
 #include <pcap/pcap.h>
+#include <ncurses.h>
 
 #include <algorithm>
 #include <array>
@@ -20,7 +21,6 @@
 #include <utility>
 #include <vector>
 
-#include <sys/ioctl.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -28,6 +28,7 @@
 namespace {
 
 pcap_t* gCaptureHandle = nullptr;
+volatile std::sig_atomic_t gStopRequested = 0;
 
 constexpr std::size_t kRadiotapMinimumLength = 8;
 constexpr std::size_t kDot11ManagementHeaderLength = 24;
@@ -74,10 +75,18 @@ struct Station {
 struct CaptureState {
     std::map<MacAddress, AccessPoint> accessPoints;
     std::map<MacAddress, Station> stations;
-    std::chrono::steady_clock::time_point lastDisplay{};
+};
+
+enum class ActivePane { AccessPoints, Stations };
+
+struct UiState {
+    ActivePane activePane = ActivePane::AccessPoints;
+    std::size_t accessPointOffset = 0;
+    std::size_t stationOffset = 0;
 };
 
 void handleSignal(int) {
+    gStopRequested = 1;
     if (gCaptureHandle != nullptr) {
         pcap_breakloop(gCaptureHandle);
     }
@@ -99,7 +108,6 @@ bool setChannel(const char* iwPath, const std::string& interfaceName,
     const std::string channelText = std::to_string(channel);
     const pid_t child = fork();
     if (child < 0) {
-        std::cerr << "fork for iw failed\n";
         return false;
     }
     if (child == 0) {
@@ -118,7 +126,9 @@ bool setChannel(const char* iwPath, const std::string& interfaceName,
 }
 
 void channelHoppingLoop(const char* iwPath, const std::string& interfaceName,
-                        const std::atomic<bool>& keepRunning) {
+                        const std::atomic<bool>& keepRunning,
+                        std::atomic<unsigned int>& currentChannel,
+                        std::atomic<int>& failedChannel) {
     constexpr std::array<unsigned int, 3> channels{1, 6, 11};
     constexpr auto dwellTime = std::chrono::milliseconds(500);
 
@@ -128,10 +138,10 @@ void channelHoppingLoop(const char* iwPath, const std::string& interfaceName,
                 return;
             }
             if (!setChannel(iwPath, interfaceName, channel)) {
-                std::cerr << "Channel hopping stopped: iw could not set channel "
-                          << channel << ". Packet capture will continue.\n";
+                failedChannel.store(static_cast<int>(channel));
                 return;
             }
+            currentChannel.store(channel);
 
             // 짧게 나눠 자면 종료 요청에 최대 50ms 안에 반응할 수 있다.
             for (int elapsed = 0; elapsed < dwellTime.count(); elapsed += 50) {
@@ -290,14 +300,51 @@ std::optional<std::string> findSsidElement(const u_char* dot11,
     return std::nullopt;
 }
 
-void displayAccessPoints(CaptureState& state) {
-    const auto now = std::chrono::steady_clock::now();
-    if (state.lastDisplay.time_since_epoch().count() != 0 &&
-        now - state.lastDisplay < std::chrono::milliseconds(250)) {
-        return;
+void addClippedLine(int row, const std::string& line) {
+    if (row >= 0 && row < LINES && COLS > 1) {
+        mvaddnstr(row, 0, line.c_str(), COLS - 1);
     }
-    state.lastDisplay = now;
+}
 
+std::string formatAccessPointRow(const MacAddress& bssid,
+                                 const AccessPoint& accessPoint) {
+    std::ostringstream output;
+    output << std::left << std::setw(20) << formatMacAddress(bssid)
+           << std::right << std::setw(12) << accessPoint.beaconCount
+           << std::setw(10) << accessPoint.dataCount << std::setw(7)
+           << (accessPoint.powerDbm ? std::to_string(*accessPoint.powerDbm)
+                                    : "?")
+           << std::setw(6)
+           << (accessPoint.channel ? std::to_string(*accessPoint.channel)
+                                   : "?")
+           << std::setw(12) << accessPoint.encryption << "  "
+           << accessPoint.essid;
+    return output.str();
+}
+
+std::string formatStationRow(const MacAddress& stationAddress,
+                             const Station& station) {
+    const std::string bssid = station.associatedBssid
+                                  ? formatMacAddress(*station.associatedBssid)
+                                  : "(not associated)";
+    std::ostringstream output;
+    output << std::left << std::setw(20) << bssid << std::setw(20)
+           << formatMacAddress(stationAddress) << std::right << std::setw(10)
+           << station.frameCount << "  " << station.probedEssid;
+    return output.str();
+}
+
+std::size_t clampOffset(std::size_t offset, std::size_t itemCount,
+                        std::size_t visibleRows) {
+    if (visibleRows == 0 || itemCount <= visibleRows) {
+        return 0;
+    }
+    return std::min(offset, itemCount - visibleRows);
+}
+
+void drawScreen(const CaptureState& state, UiState& ui,
+                unsigned int currentChannel, int failedChannel,
+                bool iwAvailable) {
     std::vector<std::pair<MacAddress, AccessPoint>> accessPoints(
         state.accessPoints.begin(), state.accessPoints.end());
     std::sort(accessPoints.begin(), accessPoints.end(),
@@ -320,64 +367,157 @@ void displayAccessPoints(CaptureState& state) {
                   return left.first < right.first;
               });
 
-    winsize terminalSize{};
-    std::size_t terminalRows = 40;
-    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &terminalSize) == 0 &&
-        terminalSize.ws_row != 0) {
-        terminalRows = terminalSize.ws_row;
+    erase();
+    if (LINES < 10 || COLS < 60) {
+        addClippedLine(0, "Terminal is too small (minimum 60x10). Resize it.");
+        addClippedLine(1, "Press q to quit.");
+        refresh();
+        return;
     }
 
-    // 두 header와 구분용 빈 줄, 마지막 줄 스크롤 방지 여유를 뺀다.
-    const std::size_t usableRows = terminalRows > 4 ? terminalRows - 4 : 0;
-    std::size_t stationRows = stations.empty()
-                                  ? 0
-                                  : std::min(stations.size(), usableRows / 3);
-    std::size_t accessPointRows =
-        std::min(accessPoints.size(), usableRows - stationRows);
-    // AP가 적으면 남는 영역을 Station이 사용한다.
-    stationRows =
-        std::min(stations.size(), usableRows - accessPointRows);
+    const int statusRow = LINES - 1;
+    const int accessPointSectionHeight = std::max(4, statusRow * 2 / 3);
+    const int stationStartRow = accessPointSectionHeight;
+    const int accessPointVisibleRows = accessPointSectionHeight - 2;
+    const int stationVisibleRows = statusRow - stationStartRow - 2;
 
-    std::cout << "\033[2J\033[H"
-              << std::left << std::setw(20) << "BSSID"
-              << std::right << std::setw(12) << "Beacons"
-              << std::setw(10) << "#Data"
-              << std::setw(7) << "PWR"
-              << std::setw(6) << "CH"
-              << std::setw(12) << "ENC"
-              << "  ESSID\n";
-    for (std::size_t i = 0; i < accessPointRows; ++i) {
-        const auto& [bssid, accessPoint] = accessPoints[i];
-        std::cout << std::left << std::setw(20) << formatMacAddress(bssid)
-                  << std::right << std::setw(12) << accessPoint.beaconCount
-                  << std::setw(10) << accessPoint.dataCount
-                  << std::setw(7)
-                  << (accessPoint.powerDbm
-                          ? std::to_string(*accessPoint.powerDbm)
-                          : "?")
-                  << std::setw(6)
-                  << (accessPoint.channel
-                          ? std::to_string(*accessPoint.channel)
-                          : "?")
-                  << std::setw(12) << accessPoint.encryption
-                  << "  " << accessPoint.essid << '\n';
+    ui.accessPointOffset = clampOffset(
+        ui.accessPointOffset, accessPoints.size(),
+        static_cast<std::size_t>(accessPointVisibleRows));
+    ui.stationOffset = clampOffset(
+        ui.stationOffset, stations.size(),
+        static_cast<std::size_t>(std::max(0, stationVisibleRows)));
+
+    std::ostringstream title;
+    title << " Access Points [" << accessPoints.size() << "] ";
+    if (ui.activePane == ActivePane::AccessPoints) {
+        attron(A_REVERSE);
     }
-    std::cout << "\n"
-              << std::left << std::setw(20) << "BSSID"
-              << std::setw(20) << "STATION"
-              << std::right << std::setw(10) << "Frames"
-              << "  Probes\n";
-    for (std::size_t i = 0; i < stationRows; ++i) {
-        const auto& [stationAddress, station] = stations[i];
-        const std::string bssid = station.associatedBssid
-                                      ? formatMacAddress(*station.associatedBssid)
-                                      : "(not associated)";
-        std::cout << std::left << std::setw(20) << bssid
-                  << std::setw(20) << formatMacAddress(stationAddress)
-                  << std::right << std::setw(10) << station.frameCount
-                  << "  " << station.probedEssid << '\n';
+    addClippedLine(0, title.str());
+    if (ui.activePane == ActivePane::AccessPoints) {
+        attroff(A_REVERSE);
     }
-    std::cout << std::flush;
+    addClippedLine(1,
+        "BSSID                   Beacons     #Data    PWR    CH         ENC  ESSID");
+    for (int row = 0; row < accessPointVisibleRows; ++row) {
+        const std::size_t index = ui.accessPointOffset +
+                                  static_cast<std::size_t>(row);
+        if (index >= accessPoints.size()) {
+            break;
+        }
+        const auto& [bssid, accessPoint] = accessPoints[index];
+        addClippedLine(row + 2, formatAccessPointRow(bssid, accessPoint));
+    }
+
+    title.str("");
+    title.clear();
+    title << " Stations [" << stations.size() << "] ";
+    if (ui.activePane == ActivePane::Stations) {
+        attron(A_REVERSE);
+    }
+    addClippedLine(stationStartRow, title.str());
+    if (ui.activePane == ActivePane::Stations) {
+        attroff(A_REVERSE);
+    }
+    addClippedLine(stationStartRow + 1,
+                   "BSSID               STATION                 Frames  Probes");
+    for (int row = 0; row < stationVisibleRows; ++row) {
+        const std::size_t index = ui.stationOffset +
+                                  static_cast<std::size_t>(row);
+        if (index >= stations.size()) {
+            break;
+        }
+        const auto& [stationAddress, station] = stations[index];
+        addClippedLine(stationStartRow + 2 + row,
+                       formatStationRow(stationAddress, station));
+    }
+
+    std::ostringstream status;
+    status << " Tab: pane  Up/Down/PgUp/PgDn or mouse wheel: scroll  q: quit";
+    if (!iwAvailable) {
+        status << "  | iw not found: fixed channel";
+    } else if (failedChannel != 0) {
+        status << "  | hopping stopped at CH " << failedChannel;
+    } else if (currentChannel != 0) {
+        status << "  | hopping CH " << currentChannel;
+    }
+    attron(A_REVERSE);
+    addClippedLine(statusRow, status.str());
+    attroff(A_REVERSE);
+    refresh();
+}
+
+void moveOffset(std::size_t& offset, std::size_t itemCount, int amount) {
+    if (amount < 0) {
+        const std::size_t distance = static_cast<std::size_t>(-amount);
+        offset = distance > offset ? 0 : offset - distance;
+    } else if (amount > 0 && itemCount != 0) {
+        offset = std::min(offset + static_cast<std::size_t>(amount),
+                          itemCount - 1);
+    }
+}
+
+bool processInput(UiState& ui, const CaptureState& state) {
+    bool quit = false;
+    int key = 0;
+    while ((key = getch()) != ERR) {
+        if (key == 'q' || key == 'Q') {
+            quit = true;
+            continue;
+        }
+        if (key == '\t') {
+            ui.activePane = ui.activePane == ActivePane::AccessPoints
+                                ? ActivePane::Stations
+                                : ActivePane::AccessPoints;
+            continue;
+        }
+
+        if (key == KEY_MOUSE) {
+            MEVENT event{};
+            if (getmouse(&event) == OK) {
+                const int stationStart = std::max(4, (LINES - 1) * 2 / 3);
+                ui.activePane = event.y >= stationStart
+                                    ? ActivePane::Stations
+                                    : ActivePane::AccessPoints;
+                const int amount = (event.bstate & BUTTON4_PRESSED) != 0
+                                       ? -3
+                                   : (event.bstate & BUTTON5_PRESSED) != 0
+                                       ? 3
+                                       : 0;
+                if (ui.activePane == ActivePane::AccessPoints) {
+                    moveOffset(ui.accessPointOffset,
+                               state.accessPoints.size(), amount);
+                } else {
+                    moveOffset(ui.stationOffset, state.stations.size(), amount);
+                }
+            }
+            continue;
+        }
+
+        std::size_t* offset = ui.activePane == ActivePane::AccessPoints
+                                  ? &ui.accessPointOffset
+                                  : &ui.stationOffset;
+        const std::size_t itemCount = ui.activePane == ActivePane::AccessPoints
+                                          ? state.accessPoints.size()
+                                          : state.stations.size();
+        const int pageSize = ui.activePane == ActivePane::AccessPoints
+                                 ? std::max(1, (LINES - 1) * 2 / 3 - 2)
+                                 : std::max(1, (LINES - 1) / 3 - 2);
+        if (key == KEY_UP) {
+            moveOffset(*offset, itemCount, -1);
+        } else if (key == KEY_DOWN) {
+            moveOffset(*offset, itemCount, 1);
+        } else if (key == KEY_PPAGE) {
+            moveOffset(*offset, itemCount, -pageSize);
+        } else if (key == KEY_NPAGE) {
+            moveOffset(*offset, itemCount, pageSize);
+        } else if (key == KEY_HOME) {
+            *offset = 0;
+        } else if (key == KEY_END) {
+            *offset = itemCount == 0 ? 0 : itemCount - 1;
+        }
+    }
+    return quit;
 }
 
 void handlePacket(u_char* user, const pcap_pkthdr* header,
@@ -437,7 +577,6 @@ void handlePacket(u_char* user, const pcap_pkthdr* header,
                 station.associatedBssid = bssid;
                 ++station.frameCount;
             }
-            displayAccessPoints(state);
         }
         return;
     }
@@ -459,7 +598,6 @@ void handlePacket(u_char* user, const pcap_pkthdr* header,
         if (probedEssid && *probedEssid != "<hidden>") {
             station.probedEssid = *probedEssid;
         }
-        displayAccessPoints(state);
         return;
     }
 
@@ -539,7 +677,6 @@ void handlePacket(u_char* user, const pcap_pkthdr* header,
     } else {
         accessPoint.encryption = "WEP";
     }
-    displayAccessPoints(state);
 }
 
 }  // namespace
@@ -552,7 +689,7 @@ int main(int argc, char* argv[]) {
 
     std::array<char, PCAP_ERRBUF_SIZE> errorBuffer{};
     pcap_t* handle = pcap_open_live(
-        argv[1], BUFSIZ, 1, 1000, errorBuffer.data());
+        argv[1], BUFSIZ, 1, 100, errorBuffer.data());
     if (handle == nullptr) {
         std::cerr << "pcap_open_live failed: " << errorBuffer.data() << '\n';
         return EXIT_FAILURE;
@@ -565,6 +702,7 @@ int main(int argc, char* argv[]) {
         return EXIT_FAILURE;
     }
 
+    gStopRequested = 0;
     gCaptureHandle = handle;
     if (std::signal(SIGINT, handleSignal) == SIG_ERR ||
         std::signal(SIGTERM, handleSignal) == SIG_ERR) {
@@ -576,27 +714,71 @@ int main(int argc, char* argv[]) {
 
     const char* iwPath = findIwExecutable();
     std::atomic<bool> keepHopping{true};
+    std::atomic<unsigned int> currentChannel{0};
+    std::atomic<int> failedChannel{0};
     std::thread hoppingThread;
+
+    if (initscr() == nullptr) {
+        std::cerr << "Failed to initialize ncurses.\n";
+        std::signal(SIGINT, SIG_DFL);
+        std::signal(SIGTERM, SIG_DFL);
+        gCaptureHandle = nullptr;
+        pcap_close(handle);
+        return EXIT_FAILURE;
+    }
+    cbreak();
+    noecho();
+    keypad(stdscr, TRUE);
+    nodelay(stdscr, TRUE);
+    curs_set(0);
+    mousemask(ALL_MOUSE_EVENTS, nullptr);
+
     if (iwPath != nullptr) {
         hoppingThread = std::thread(
             channelHoppingLoop, iwPath, std::string(argv[1]),
-            std::cref(keepHopping));
-    } else {
-        std::cerr << "Warning: iw was not found; capturing on the current "
-                     "channel only. Install it with: sudo apt install iw\n";
+            std::cref(keepHopping), std::ref(currentChannel),
+            std::ref(failedChannel));
     }
 
     CaptureState state;
-    std::cout << "Listening on " << argv[1] << "...\n";
-    const int result = pcap_loop(
-        handle, 0, handlePacket, reinterpret_cast<u_char*>(&state));
+    UiState ui;
+    int result = 0;
+    std::string captureError;
+    auto lastDraw = std::chrono::steady_clock::time_point{};
+    while (gStopRequested == 0) {
+        pcap_pkthdr* packetHeader = nullptr;
+        const u_char* packet = nullptr;
+        result = pcap_next_ex(handle, &packetHeader, &packet);
+        if (result == 1) {
+            handlePacket(reinterpret_cast<u_char*>(&state), packetHeader,
+                         packet);
+        } else if (result == PCAP_ERROR) {
+            captureError = pcap_geterr(handle);
+            break;
+        } else if (result == PCAP_ERROR_BREAK) {
+            break;
+        }
+
+        if (processInput(ui, state)) {
+            gStopRequested = 1;
+            break;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (lastDraw.time_since_epoch().count() == 0 ||
+            now - lastDraw >= std::chrono::milliseconds(250)) {
+            drawScreen(state, ui, currentChannel.load(), failedChannel.load(),
+                       iwPath != nullptr);
+            lastDraw = now;
+        }
+    }
 
     keepHopping.store(false);
     if (hoppingThread.joinable()) {
         hoppingThread.join();
     }
+    endwin();
     if (result == PCAP_ERROR) {
-        std::cerr << "pcap_loop failed: " << pcap_geterr(handle) << '\n';
+        std::cerr << "pcap_next_ex failed: " << captureError << '\n';
     }
 
     std::signal(SIGINT, SIG_DFL);

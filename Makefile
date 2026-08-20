@@ -1,6 +1,6 @@
 CXX := g++
 CXXFLAGS := -std=c++17 -Wall -Wextra -Wpedantic -O2 -pthread
-LDLIBS := -lpcap
+LDLIBS := -lpcap -lncurses
 
 TARGET := airodump
 SOURCES := main.cpp

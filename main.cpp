@@ -1,5 +1,6 @@
 #include <pcap/pcap.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -17,7 +18,9 @@
 #include <string>
 #include <thread>
 #include <utility>
+#include <vector>
 
+#include <sys/ioctl.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -295,6 +298,46 @@ void displayAccessPoints(CaptureState& state) {
     }
     state.lastDisplay = now;
 
+    std::vector<std::pair<MacAddress, AccessPoint>> accessPoints(
+        state.accessPoints.begin(), state.accessPoints.end());
+    std::sort(accessPoints.begin(), accessPoints.end(),
+              [](const auto& left, const auto& right) {
+                  const int leftPower = left.second.powerDbm.value_or(-1000);
+                  const int rightPower = right.second.powerDbm.value_or(-1000);
+                  if (leftPower != rightPower) {
+                      return leftPower > rightPower;
+                  }
+                  return left.first < right.first;
+              });
+
+    std::vector<std::pair<MacAddress, Station>> stations(
+        state.stations.begin(), state.stations.end());
+    std::sort(stations.begin(), stations.end(),
+              [](const auto& left, const auto& right) {
+                  if (left.second.frameCount != right.second.frameCount) {
+                      return left.second.frameCount > right.second.frameCount;
+                  }
+                  return left.first < right.first;
+              });
+
+    winsize terminalSize{};
+    std::size_t terminalRows = 40;
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &terminalSize) == 0 &&
+        terminalSize.ws_row != 0) {
+        terminalRows = terminalSize.ws_row;
+    }
+
+    // 두 header와 구분용 빈 줄, 마지막 줄 스크롤 방지 여유를 뺀다.
+    const std::size_t usableRows = terminalRows > 4 ? terminalRows - 4 : 0;
+    std::size_t stationRows = stations.empty()
+                                  ? 0
+                                  : std::min(stations.size(), usableRows / 3);
+    std::size_t accessPointRows =
+        std::min(accessPoints.size(), usableRows - stationRows);
+    // AP가 적으면 남는 영역을 Station이 사용한다.
+    stationRows =
+        std::min(stations.size(), usableRows - accessPointRows);
+
     std::cout << "\033[2J\033[H"
               << std::left << std::setw(20) << "BSSID"
               << std::right << std::setw(12) << "Beacons"
@@ -303,7 +346,8 @@ void displayAccessPoints(CaptureState& state) {
               << std::setw(6) << "CH"
               << std::setw(12) << "ENC"
               << "  ESSID\n";
-    for (const auto& [bssid, accessPoint] : state.accessPoints) {
+    for (std::size_t i = 0; i < accessPointRows; ++i) {
+        const auto& [bssid, accessPoint] = accessPoints[i];
         std::cout << std::left << std::setw(20) << formatMacAddress(bssid)
                   << std::right << std::setw(12) << accessPoint.beaconCount
                   << std::setw(10) << accessPoint.dataCount
@@ -323,7 +367,8 @@ void displayAccessPoints(CaptureState& state) {
               << std::setw(20) << "STATION"
               << std::right << std::setw(10) << "Frames"
               << "  Probes\n";
-    for (const auto& [stationAddress, station] : state.stations) {
+    for (std::size_t i = 0; i < stationRows; ++i) {
+        const auto& [stationAddress, station] = stations[i];
         const std::string bssid = station.associatedBssid
                                       ? formatMacAddress(*station.associatedBssid)
                                       : "(not associated)";
